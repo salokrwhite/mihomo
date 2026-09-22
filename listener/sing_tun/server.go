@@ -57,6 +57,8 @@ type Listener struct {
 
 	cDialerInterfaceFinder dialer.InterfaceFinder
 
+	restoreForwarding func()
+
 	ruleUpdateCallbackCloser io.Closer
 	ruleUpdateMutex          sync.Mutex
 	routeAddressMap          map[string]*netipx.IPSet
@@ -542,6 +544,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	if options.FileDescriptor != 0 {
 		tunName = fmt.Sprintf("%s(fd=%d)", tunName, options.FileDescriptor)
 	}
+	l.restoreForwarding = fixEgressForwarding()
 	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s",
 		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack)
 	return
@@ -619,16 +622,30 @@ func (d *cDialerInterfaceFinder) DefaultInterfaceName(destination netip.Addr) st
 }
 
 func (d *cDialerInterfaceFinder) FindInterfaceName(destination netip.Addr) string {
+	var virtualFallback string
 	for _, dest := range []netip.Addr{destination, netip.IPv4Unspecified(), netip.IPv6Unspecified()} {
 		autoDetectInterfaceName := d.DefaultInterfaceName(dest)
 		if autoDetectInterfaceName == d.tunName {
 			log.Warnln("[TUN] Auto detect interface for %s get same name with tun", destination.String())
 		} else if autoDetectInterfaceName == "" || autoDetectInterfaceName == "<nil>" {
 			log.Warnln("[TUN] Auto detect interface for %s get empty name.", destination.String())
+		} else if iface.IsVirtualInterface(autoDetectInterfaceName) {
+			// Never bind our own outbound dials to a virtual adapter: Wintun/TAP
+			// style adapters hand the packet back to us, the loopback detector
+			// rejects it and every node dial fails. Keep looking for a physical
+			// adapter, but remember this one as a last resort.
+			log.Warnln("[TUN] Auto detect interface for %s skipped virtual adapter %s", destination, autoDetectInterfaceName)
+			if virtualFallback == "" {
+				virtualFallback = autoDetectInterfaceName
+			}
 		} else {
 			log.Debugln("[TUN] Auto detect interface for %s --> %s", destination, autoDetectInterfaceName)
 			return autoDetectInterfaceName
 		}
+	}
+	if virtualFallback != "" {
+		log.Warnln("[TUN] Auto detect interface for %s only found virtual adapters, fallback to %s", destination, virtualFallback)
+		return virtualFallback
 	}
 	log.Warnln("[TUN] Auto detect interface for %s failed, return '<invalid>' to avoid lookback", destination)
 	return "<invalid>"
@@ -669,6 +686,10 @@ func parseRange[T constraints.Integer](uidRanges []ranges.Range[T], rangeList []
 func (l *Listener) Close() error {
 	l.closed = true
 	resolver.RemoveSystemDnsBlacklist(l.dnsServerIp...)
+	if l.restoreForwarding != nil {
+		l.restoreForwarding()
+		l.restoreForwarding = nil
+	}
 	if l.autoRedirectOutputMark != 0 {
 		dialer.DefaultRoutingMark.CompareAndSwap(l.autoRedirectOutputMark, 0)
 	}
